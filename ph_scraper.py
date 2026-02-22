@@ -43,7 +43,10 @@ class PornHubScraper:
         # Si se proporcionó un archivo de cookies, se intenta cargar
         if self.cookies_path and os.path.isfile(self.cookies_path):
             self.load_cookies()
-
+        
+        # Evitar cdn hv-h.phncdn.com (free preview)
+        self._init_session()
+    
     def set_proxies(self, http_proxy: str, https_proxy: str) -> None:
         """
         Configura los proxies HTTP y HTTPS de la sesión.
@@ -307,6 +310,25 @@ class PornHubScraper:
             print(f"Error inesperado: {e}")
             return False
 
+    def _init_session(self, base_url: str = "https://www.pornhub.com") -> None:
+        """
+        Hace un request inicial a PornHub para establecer cookies de sesión.
+        Sin esto, el primer request al video devuelve URLs con f=1 (free preview) cdn hv-h.phncdn.com
+        """
+        try:
+            response = self.session.get(
+                base_url,
+                headers=self.headers,
+                proxies=self.proxies,
+                timeout=15
+            )
+            # Setear cookies de edad sobre el dominio real de la respuesta
+            host = re.search(r'https?://([^/]+)', response.url)
+            if host:
+                self.set_age_cookies(host.group(1))
+            print(f"[Session] Sesión inicializada - {len(self.session.cookies)} cookies")
+        except Exception as e:
+            print(f"[Session] Warning: no se pudo inicializar la sesión: {e}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
