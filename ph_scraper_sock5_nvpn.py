@@ -6,11 +6,28 @@ import pickle
 import os.path
 import subprocess
 from typing import Optional, Dict, Any, List
+import socket
+from curl_cffi import requests as cffi_requests
 
 
 # ─────────────────────────────────────────────
 #  NordVPN SOCKS5 helper
 # ─────────────────────────────────────────────
+def _measure_proxy_latency(host: str, user: str, password: str) -> float:
+    """Mide latencia real haciendo un request HTTP a través del proxy SOCKS5."""
+    import time
+    try:
+        proxy_url = f"socks5h://{user}:{password}@{host}:1080"
+        proxies = {"http": proxy_url, "https": proxy_url}
+        start = time.time()
+        requests.get(
+            "http://www.google.com",
+            proxies=proxies,
+            timeout=5
+        )
+        return time.time() - start
+    except:
+        return float('inf')
 
 def get_best_nordvpn_proxy(user: str, password: str) -> Dict[str, str]:
     """
@@ -46,14 +63,26 @@ def get_best_nordvpn_proxy(user: str, password: str) -> Dict[str, str]:
     if not servers:
         raise Exception("No se encontraron servidores SOCKS5 disponibles en NordVPN.")
 
-    best = min(servers, key=lambda s: s.get("load", 999))
-    host = best["hostname"]
-    load = best.get("load", "?")
-    print(f"[NordVPN] Mejor servidor SOCKS5: {host} - {load}% carga")
 
-    proxy_url = f"socks5h://{user}:{password}@{host}:1080"
+    top10 = sorted(servers, key=lambda s: s.get("load", 999))[:10]
+
+    best_host = None
+    best_latency = float('inf')
+
+    for s in top10:
+        latency = _measure_proxy_latency(s["hostname"], user, password)
+        print(f"[NordVPN] {s['hostname']} - {s.get('load')}% carga - {latency*1000:.0f}ms" if latency != float('inf') else f"[NordVPN] {s['hostname']} - {s.get('load')}% carga - no responde")
+        if latency < best_latency:
+            best_latency = latency
+            best_host = s
+
+    # Si ninguno respondió, error claro
+    if best_host is None or best_latency == float('inf'):
+        raise Exception("Ningún servidor SOCKS5 de NordVPN respondió. Verificá las credenciales o intentá más tarde.")
+
+    print(f"[NordVPN] Elegido: {best_host['hostname']} - {best_latency*1000:.0f}ms")
+    proxy_url = f"socks5h://{user}:{password}@{best_host['hostname']}:1080"
     return {"http": proxy_url, "https": proxy_url}
-
 
 # ─────────────────────────────────────────────
 #  Scraper
@@ -74,7 +103,7 @@ class PornHubScraper:
                                 de NordVPN eligiendo el servidor con menor carga.
         """
         self.cookies_path = cookies_path
-        self.session = requests.Session()
+        
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -100,7 +129,15 @@ class PornHubScraper:
                 try:
                     self.proxies = get_best_nordvpn_proxy(self.NORDVPN_USER, self.NORDVPN_PASS)
                 except Exception as e:
-                    print(f"[NordVPN] No se pudo configurar el proxy: {e}. Continuando sin proxy.")
+                    print(f"[NordVPN] {e}. Continuando sin proxy.")
+                    self.proxies = {"http": None, "https": None}
+
+        if self.proxies.get("https"):
+            print(f"[Scraper] Modo: SOCKS5 via NordVPN")
+        else:
+            print(f"[Scraper] Modo: Sin proxy (IP directa del servidor)")
+
+        self.session = cffi_requests.Session(impersonate="chrome120")
 
         if self.cookies_path and os.path.isfile(self.cookies_path):
             self.load_cookies()
@@ -199,28 +236,23 @@ class PornHubScraper:
             raise Exception(f"Error al descargar la página: {e}")
 
     def download_webpage_with_js(self, url: str) -> str:
-        """
-        Descarga el HTML procesado mediante PhantomJS (para contenido generado dinámicamente).
-
-        Args:
-            url (str): URL a descargar.
-
-        Returns:
-            str: HTML procesado.
-
-        Raises:
-            Exception: Si ocurre un error al ejecutar PhantomJS.
-        """
         try:
+            # Intentar con el binario del paquete pip phantomjs-binary
+            try:
+                from phantomjs_bin import executable_path
+                phantomjs_bin = executable_path
+            except ImportError:
+                phantomjs_bin = 'phantomjs'  # fallback al PATH del sistema
+
             env = os.environ.copy()
             env['OPENSSL_CONF'] = '/etc/ssl/openssl-legacy.cnf'
-            cmd = ['phantomjs', 'phantom_downloader.js', url]
+            cmd = [phantomjs_bin, 'phantom_downloader.js', url]
             result = subprocess.run(cmd, capture_output=True, text=True, check=True, env=env)
             return result.stdout
         except subprocess.CalledProcessError as e:
             raise Exception(f"Error al ejecutar PhantomJS: {e.stderr}")
         except FileNotFoundError:
-            raise Exception("PhantomJS no está instalado o no se encuentra en el PATH.")
+            raise Exception("PhantomJS no está instalado.")
         except Exception as e:
             raise Exception(f"Error inesperado con PhantomJS: {e}")
 
@@ -298,8 +330,9 @@ class PornHubScraper:
         Raises:
             Exception: Si la URL no es válida o hay un error en la página.
         """
-        # Sesión limpia por cada video para evitar contaminación entre requests
-        self.session = requests.Session()
+        
+        # chequear si es mejor limpiar la session o no
+        #self.session = cffi_requests.Session(impersonate="chrome120")
 
         m = self.video_regex.match(url)
         if not m:
@@ -411,7 +444,19 @@ class PornHubScraper:
 
     def _ffmpeg_header_string(self, extra: Optional[Dict[str, str]] = None) -> str:
         hdr = {"User-Agent": self.headers["User-Agent"]}
-        cookies = "; ".join(f"{c.name}={c.value}" for c in self.session.cookies)
+        
+        try:
+            # curl_cffi: evitar duplicados usando un dict (última cookie gana)
+            cookie_dict = {}
+            for cookie in self.session.cookies.jar:
+                cookie_dict[cookie.name] = cookie.value
+            cookies = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
+        except AttributeError:
+            try:
+                cookies = "; ".join(f"{c.name}={c.value}" for c in self.session.cookies)
+            except:
+                cookies = ""
+        
         if cookies:
             hdr["Cookie"] = cookies
         if extra:
@@ -419,23 +464,37 @@ class PornHubScraper:
         return "".join(f"{k}: {v}\r\n" for k, v in hdr.items())
 
     def download_video_with_ffmpeg(self, video_url: str, output_video: str, referer_url: Optional[str] = None) -> bool:
-        """
-        Descarga el video usando ffmpeg. Soporta tanto URLs MP4 directas como m3u8.
-
-        Args:
-            video_url (str): URL del video (MP4 directo o m3u8).
-            output_video (str): Ruta de salida del video.
-            referer_url (str, opcional): URL de referencia para los headers.
-
-        Returns:
-            bool: True si fue exitoso, False en caso contrario.
-        """
         try:
             header_str = self._ffmpeg_header_string({"Referer": referer_url} if referer_url else None)
-
-            # Para MP4 directo no necesita -bsf:a aac_adtstoasc (solo para HLS)
             is_hls = 'm3u8' in video_url.lower()
-            cmd = [
+
+            cmd = []
+
+            # Si hay proxy SOCKS5 configurado, generar proxychains config dinámico
+            socks_proxy = self.proxies.get("https") or self.proxies.get("http")
+            if socks_proxy:
+                # Parsear socks5h://user:pass@host:port
+                match = re.match(r'socks5h?://([^:]+):([^@]+)@([^:]+):(\d+)', socks_proxy)
+                if match:
+                    user, password, host, port = match.groups()
+                    
+                    # Resolver hostname a IP numérica (proxychains no acepta hostnames)
+                    try:
+                        host_ip = socket.gethostbyname(host)
+                        print(f"[proxychains] {host} → {host_ip}")
+                    except socket.gaierror:
+                        host_ip = host  # fallback si falla la resolución
+
+                    proxychains_conf = f"/tmp/proxychains_{os.getpid()}.conf"
+                    with open(proxychains_conf, 'w') as f:
+                        f.write(f"strict_chain\nproxy_dns\n[ProxyList]\nsocks5 {host_ip} {port} {user} {password}\n")
+                    cmd = ['proxychains4', '-q', '-f', proxychains_conf]
+            else:
+                # Sin proxy, ffmpeg directo
+                print("[ffmpeg] Sin proxy, descargando directo...")
+                cmd = []
+
+            cmd += [
                 'ffmpeg',
                 '-user_agent', self.headers['User-Agent'],
                 '-headers', header_str,
@@ -446,21 +505,25 @@ class PornHubScraper:
                 cmd += ['-bsf:a', 'aac_adtstoasc']
             cmd.append(output_video)
 
-            print(f"[ffmpeg] Descargando {'HLS' if is_hls else 'MP4 directo'}...")
+            print(f"[ffmpeg] Descargando {'HLS' if is_hls else 'MP4 directo'} via {'proxychains' if socks_proxy else 'directo'}...")
             subprocess.run(cmd, check=True, capture_output=True, text=True)
             print(f"[ffmpeg] Video guardado en: {output_video}")
+
+            # Limpiar conf temporal
+            if socks_proxy and os.path.exists(proxychains_conf):
+                os.remove(proxychains_conf)
+
             return True
 
         except subprocess.CalledProcessError as e:
             print(f"[ffmpeg] Error: {e.stderr[-500:] if e.stderr else e}")
             return False
         except FileNotFoundError:
-            print("[ffmpeg] ffmpeg no está instalado o no se encuentra en el PATH.")
+            print("[ffmpeg] ffmpeg o proxychains4 no están instalados.")
             return False
         except Exception as e:
             print(f"[ffmpeg] Error inesperado: {e}")
             return False
-
 
 # ─────────────────────────────────────────────
 #  Main
