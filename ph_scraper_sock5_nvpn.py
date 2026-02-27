@@ -449,7 +449,7 @@ class PornHubScraper:
             # curl_cffi: evitar duplicados usando un dict (última cookie gana)
             cookie_dict = {}
             for cookie in self.session.cookies.jar:
-                cookie_dict[cookie.name] = cookie.value
+                cookie_dict[cookie.name] = cookie.value.replace('\n', '').replace('\r', '').strip()
             cookies = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
         except AttributeError:
             try:
